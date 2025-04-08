@@ -1,0 +1,121 @@
+-하드웨어 재설계
+1.인풋 전압이 20v 이상일 것인데, 아두이노용 전압 변환기의 전력 손실은 어떻게 할 것인가?
+2.조사결과 인풋 dc-dc 컨버터 칩이 TPS62177 인 경우 부하 전류를 스스로 감지해서 슬립 모드로 들어가고, 전압변환 효율도 높은 것으로 보임
+3.aiitny85 칩도 여전히 가능성 있다. 소프트웨어시리얼과 슬립모드를 사용하는 것이 가능하다고 gpt가 언급함
+
+아래는 예제 코드임
+
+/*이 코드는 **ATTinyCore (SpenceKonde)**를 설치한 Arduino IDE에서만 정상 작동해.
+
+보드 설정 예시:
+Board: ATTiny25/45/85
+Chip: ATTiny85
+Clock: 1 MHz (Internal) 또는 8 MHz (Internal)
+Core: ATTinyCore by SpenceKonde
+*/
+
+/*
+  ========================================
+            ATTiny85 DIP-8 핀맵
+  ========================================
+  
+         ┌───────────────┐
+  Reset ─│ 1           8 │─ Vcc (+전원)
+   A3   ─│ 2           7 │─ A1   → 아날로그 입력 핀 (ADC1)
+   A2   ─│ 3           6 │─ D1   → WDT용 출력 or 상태 표시 (옵션)
+   GND  ─│ 4           5 │─ D0 / TX → 소프트웨어 시리얼 송신
+         └───────────────┘
+
+  핀 기능 요약:
+  --------------------------
+  1 (PB5) - Reset / 디지털 입력 / ISP
+  2 (PB3) - A3 / ADC3 / 디지털 IO
+  3 (PB4) - A2 / ADC2 / 디지털 IO
+  4       - GND
+  5 (PB0) - D0 / 소프트웨어 시리얼 TX (TX 출력용)
+  6 (PB1) - D1 / 디지털 IO (사용 안함 또는 디버그 LED 등)
+  7 (PB2) - A1 / ADC1 → 배터리 전압 측정용 아날로그 입력
+  8       - VCC (+ 전원입력, 예: 3.3V 또는 5V)
+
+  사용된 핀 설명:
+  --------------------------
+  A1 (핀 7 / PB2)  → 배터리 전압을 읽는 아날로그 입력 핀
+  D0 (핀 5 / PB0)  → 소프트웨어 시리얼 TX 출력 핀 (USB-TTL과 연결)
+*/
+
+
+#include <avr/sleep.h>         // 슬립 모드 관련 기능
+#include <avr/wdt.h>           // 워치독 타이머 (WDT) 설정용
+#include <TinyDebugSerial.h>   // TX 전용 소프트웨어 시리얼 라이브러리 (ATTinyCore 필요)
+
+// 🧷 핀 설정
+#define ANALOG_PIN A1          // 아날로그 입력 핀 (physical pin 7)
+#define TX_PIN 4               // 소프트웨어 시리얼 TX 핀 (physical pin 3)
+
+// 전역 플래그: WDT 인터럽트 발생 시 true로 설정됨
+volatile bool wakeUpFlag = false;
+
+// 시리얼 객체 생성 (TinyDebugSerial: TX 전용, RX 없음)
+TinyDebugSerial mySerial;
+
+//
+// 워치독 타이머 인터럽트 서비스 루틴
+// 슬립에서 깨어나기 위한 플래그 설정
+//
+ISR(WDT_vect) {
+  wakeUpFlag = true;
+}
+
+//
+// 슬립 모드로 진입하는 함수 (Power-down)
+// WDT가 설정되어 있어야 자동으로 깨어남
+//
+void enterSleep() {
+  set_sleep_mode(SLEEP_MODE_PWR_DOWN);  // 최저 전력 모드 설정
+  noInterrupts();        // 인터럽트 중단
+  sleep_enable();        // 슬립 활성화
+  interrupts();          // 인터럽트 다시 허용
+  sleep_cpu();           // 슬립 모드 진입
+
+  // 여기서 깨어남
+  sleep_disable();       // 슬립 비활성화
+}
+
+//
+// WDT를 5초 간격으로 설정하는 함수
+//
+void setupWDT_5s() {
+  MCUSR &= ~(1 << WDRF); // WDT 리셋 플래그 제거
+  WDTCSR |= (1 << WDCE) | (1 << WDE);  // 변경 모드 진입
+
+  // WDT 인터럽트만 사용, 시스템 리셋 없이 슬립에서 깨어남
+  WDTCSR = (1 << WDIE) | (1 << WDP3) | (1 << WDP0); // 약 5.0초 설정
+}
+
+//
+// 초기 설정 함수: 핀, 시리얼, 초기 지연 등
+//
+void setup() {
+  pinMode(ANALOG_PIN, INPUT);   // 아날로그 핀 입력 설정
+  mySerial.begin(9600);         // 소프트웨어 시리얼 시작 (TX만)
+
+  delay(3000);  // 🕒 시작 후 3초 대기 (시스템 안정화 또는 부트 타임 확보)
+
+  setupWDT_5s(); // 워치독 타이머 5초 설정
+}
+
+//
+// 메인 루프: 아날로그 값 읽고 전송 후 슬립
+//
+void loop() {
+  int analogValue = analogRead(ANALOG_PIN);  // 아날로그 값 읽기
+
+  mySerial.print("Analog Value: ");          // 시리얼 출력 시작
+  mySerial.println(analogValue);             // 아날로그 값 전송
+  mySerial.flush();                          // 데이터 전송이 끝날 때까지 대기
+
+  wakeUpFlag = false;  // 슬립 전에 플래그 초기화
+  enterSleep();        // 슬립 진입
+
+  while (!wakeUpFlag); // 깨어날 때까지 대기 (WDT 인터럽트 발생 시 깨어남)
+}
